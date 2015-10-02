@@ -8,74 +8,43 @@ import (
 	"path/filepath"
 	"strings"
 
-	"golang.org/x/net/context"
+	"cjlucas.net/unitefs/unitefs"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
 )
 
-type Node struct {
-	Name  string
-	Inode uint64
-	Mode  os.FileMode
-}
+type HandleMap map[fuse.HandleID]*os.File
 
-func (n Node) Children() []Node {
-	return tree.Nodes[n]
-}
+var masterHandleMap HandleMap
 
-func (n Node) Attr(ctx context.Context, a *fuse.Attr) error {
-	a.Inode = n.Inode
-	a.Mode = n.Mode
-	a.Size = 0
-	return nil
-}
-
-func (n Node) Lookup(ctx context.Context, name string) (fs.Node, error) {
-	for _, c := range n.Children() {
-		if name == c.Name {
-			return c, nil
-		}
+func (m HandleMap) Open(id fuse.HandleID, name string) (*os.File, error) {
+	if _, ok := m[id]; ok {
+		panic(fmt.Sprintf("Handle with id %d already present in map\n", id))
 	}
 
-	return nil, fuse.ENOENT
-}
+	fp, err := os.Open(name)
 
-func (n Node) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
-	fmt.Println("ReadDirAll", n)
-	children := n.Children()
-	dirs := make([]fuse.Dirent, len(children))
-
-	for i := range dirs {
-		c := children[i]
-		dirs[i].Name = c.Name
-		dirs[i].Inode = c.Inode
-		if os.ModeDir&c.Mode > 0 {
-			dirs[i].Type = fuse.DT_Dir
-		} else {
-			dirs[i].Type = fuse.DT_File
-		}
+	if err == nil {
+		m[id] = fp
 	}
 
-	fmt.Println(dirs)
-	return dirs, nil
+	return fp, err
 }
 
-func NewNode(name string, inode uint64) Node {
-	return Node{Name: name, Inode: inode}
+func (m HandleMap) Close(id fuse.HandleID) error {
+	return m[id].Close()
 }
 
-type NodeChildMap map[Node][]Node
-type Tree struct {
-	Root  Node
-	Nodes NodeChildMap
+func (m HandleMap) ReadAt(id fuse.HandleID, offset int64, buf []byte) (int, error) {
+	if fp, ok := m[id]; ok {
+		return fp.ReadAt(buf, offset)
+	}
+
+	panic(fmt.Sprintf("Handle with id %d not found in map", id))
 }
 
-func (t Tree) Add(node Node) {
-	t.Nodes[node] = make([]Node, 0)
-}
-
-var tree Tree
+var tree fs.Tree
 var nextInode = uint64(2)
 
 func RootWalker(pathStr string, info os.FileInfo, err error) error {
@@ -83,7 +52,7 @@ func RootWalker(pathStr string, info os.FileInfo, err error) error {
 	rootPath := path.Clean(os.Args[1])
 
 	if len(pathStr) == len(rootPath) {
-		tree.Root = NewNode("/", 1)
+		tree.Root = unitefs.NewNode("/", 1)
 		tree.Root.Mode = os.ModeDir | 0777
 		tree.Nodes = make(NodeChildMap)
 		tree.Add(tree.Root)
@@ -100,9 +69,11 @@ func RootWalker(pathStr string, info os.FileInfo, err error) error {
 		name := pathSplit[i]
 
 		if i == len(pathSplit)-1 {
-			node := NewNode(name, nextInode)
+			node := unitefs.NewNode(name, nextInode)
 			node.Name = name
 			node.Mode = info.Mode()
+			node.Size = uint64(info.Size())
+			node.RealPath = pathStr
 
 			tree.Nodes[parent] = append(tree.Nodes[parent], node)
 			tree.Add(node)
@@ -122,6 +93,7 @@ func RootWalker(pathStr string, info os.FileInfo, err error) error {
 
 func main() {
 	src := path.Clean(os.Args[1])
+	masterHandleMap = make(HandleMap)
 
 	filepath.Walk(src, RootWalker)
 	fmt.Println(tree)
@@ -138,7 +110,7 @@ func main() {
 	}
 	defer c.Close()
 
-	err = fs.Serve(c, FS{})
+	err = fs.Serve(c, unitefs.FS{})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -148,10 +120,4 @@ func main() {
 	if err := c.MountError; err != nil {
 		log.Fatal(err)
 	}
-}
-
-type FS struct{}
-
-func (fs FS) Root() (fs.Node, error) {
-	return tree.Root, nil
 }
