@@ -3,6 +3,9 @@ package unitefs
 import (
 	"fmt"
 	"os"
+	"path"
+	"syscall"
+	"time"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
@@ -14,11 +17,36 @@ type Node struct {
 	RealPath string
 	Inode    uint64
 	Size     uint64
+	Mtime    time.Time
+	Ctime    time.Time
 	Mode     os.FileMode
+	Tree     *Tree
+}
+
+func timeFromTimespec(ts syscall.Timespec) time.Time {
+	sec, nsec := ts.Unix()
+	return time.Unix(sec, nsec)
+}
+
+func newNodeForPath(fpath string) (*Node, error) {
+	stat := syscall.Stat_t{}
+	if err := syscall.Stat(fpath, &stat); err != nil {
+		return nil, err
+	}
+
+	node := Node{}
+	node.RealPath = path.Clean(fpath)
+	_, node.Name = path.Split(node.RealPath)
+	node.Size = uint64(stat.Size)
+	node.Mtime = timeFromTimespec(stat.Mtimespec)
+	node.Ctime = timeFromTimespec(stat.Ctimespec)
+	node.Mode = os.FileMode(stat.Mode)
+
+	return &node, nil
 }
 
 func (n Node) Children() []Node {
-	return tree.Nodes[n]
+	return n.Tree.Nodes[n]
 }
 
 func (n Node) Attr(ctx context.Context, a *fuse.Attr) error {
@@ -40,21 +68,25 @@ func (n Node) Lookup(ctx context.Context, name string) (fs.Node, error) {
 
 func (n Node) Flush(ctx context.Context, req *fuse.FlushRequest) error {
 	fmt.Println("Flush")
-	if fp, ok := masterHandleMap[req.Handle]; ok {
-		delete(masterHandleMap, req.Handle)
-		return fp.Close()
-	}
+	/*
+	 *if fp, ok := masterHandleMap[req.Handle]; ok {
+	 *    delete(masterHandleMap, req.Handle)
+	 *    return fp.Close()
+	 *}
+	 */
 
 	return nil
 }
 
 func (n Node) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) error {
-	if fp, ok := masterHandleMap[req.Handle]; fp == nil || !ok {
-		masterHandleMap.Open(req.Handle, n.RealPath)
-	}
+	/*
+	 *if fp, ok := masterHandleMap[req.Handle]; fp == nil || !ok {
+	 *    masterHandleMap.Open(req.Handle, n.RealPath)
+	 *}
+	 */
 
 	resp.Data = make([]byte, req.Size)
-	masterHandleMap.ReadAt(req.Handle, req.Offset, resp.Data)
+	//masterHandleMap.ReadAt(req.Handle, req.Offset, resp.Data)
 	return nil
 }
 
@@ -78,11 +110,8 @@ func (n Node) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 	return dirs, nil
 }
 
-func NewNode(name string, inode uint64) Node {
-	return Node{Name: name, Inode: inode}
-}
-
 type NodeChildMap map[Node][]Node
+
 type Tree struct {
 	Root  Node
 	Nodes NodeChildMap
@@ -92,12 +121,16 @@ func (t Tree) Add(node Node) {
 	t.Nodes[node] = make([]Node, 0)
 }
 
+type UnionTree struct {
+	Trees      map[string]Tree
+	usedInodes []uint64
+}
+
 type FS struct {
 	UnionTree Tree
-	Trees     map[string]Tree
 	HandleMap map[fuse.HandleID]*os.File
 }
 
 func (fs FS) Root() (fs.Node, error) {
-	return tree.Root, nil
+	return fs.UnionTree.Root, nil
 }
